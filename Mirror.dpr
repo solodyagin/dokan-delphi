@@ -56,6 +56,16 @@ const
 
   INVALID_SET_FILE_POINTER           = $FFFFFFFF;
 
+function ToNtStatus(dwError : Cardinal) : NTSTATUS;
+begin
+	case dwError of
+	  ERROR_FILE_NOT_FOUND: Result := NTSTATUS_OBJECT_NAME_NOT_FOUND;
+	  ERROR_PATH_NOT_FOUND: Result := NTSTATUS_OBJECT_PATH_NOT_FOUND;
+	  ERROR_INVALID_PARAMETER: Result := NTSTATUS_INVALID_PARAMETER;
+	  else Result := NTSTATUS_ACCESS_DENIED;
+	end;
+end;
+  
 // Utilities routines, to be defined later
 procedure DbgPrint(const Message: string); overload; forward;
 procedure DbgPrint(const Format: string; const Args: array of const); overload; forward;
@@ -90,6 +100,7 @@ begin
     DOKAN_DRIVER_INSTALL_ERROR: s := 'Cannot install driver';
     DOKAN_START_ERROR: s := 'Cannot start driver';
     DOKAN_MOUNT_ERROR: s := 'Cannot mount on the specified drive letter';
+    DOKAN_MOUNT_POINT_ERROR : s := 'Mount point error';
   else
     s := 'Unknown error';
   end;
@@ -99,7 +110,7 @@ end;
 // Dokan callbacks
 function MirrorCreateFile(FileName: PWideChar;
                           AccessMode, ShareMode, CreationDisposition, FlagsAndAttributes: Cardinal;
-                          var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                          var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 const
@@ -182,66 +193,72 @@ begin
 
 // Save the file handle in Context
   DokanFileInfo.Context := CreateFile(PChar(FilePath), AccessMode, ShareMode, nil, CreationDisposition, FlagsAndAttributes, 0);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-// Error codes are negated value of Win32 error codes
-    Result := -GetLastError;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    // Error codes are negated value of Win32 error codes
+    Result := ToNtStatus(GetLastError);
     DbgPrint('CreateFile failed, error code = %d', [-Result]);
   end else
-    Result := 0;
+    Result := NTSTATUS_SUCCESS;
   DbgPrint('');
 end;
 
 function MirrorOpenDirectory(FileName: PWideChar;
-                             var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                             var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('OpenDirectory: %s', [FilePath]);
   DokanFileInfo.Context := CreateFile(PChar(FilePath), 0, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -GetLastError;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := ToNtStatus(GetLastError);
     DbgPrint('CreateFile failed, error code = %d', [-Result]);
   end else
-    Result := 0;
+    Result := NTSTATUS_SUCCESS;
   DbgPrint('');
 end;
 
 function MirrorCreateDirectory(FileName: PWideChar;
-                               var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                               var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('CreateDirectory: %s', [FilePath]);
-  if not CreateDirectory(PChar(FilePath), nil) then begin
-    Result := -GetLastError;
+  if not CreateDirectory(PChar(FilePath), nil) then
+  begin
+    Result := ToNtStatus(GetLastError);
     DbgPrint('CreateDirectory failed, error code = %d', [-Result]);
   end else
-    Result := 0;
+    Result := NTSTATUS_SUCCESS;
   DbgPrint('');
 end;
 
-function MirrorCleanup(FileName: PWideChar;
-                       var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+procedure MirrorCleanup(FileName: PWideChar;
+                       var DokanFileInfo: TDokanFileInfo); stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('Cleanup: %s', [FilePath]);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -1;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
     DbgPrint('Error: invalid handle', [FilePath]);
-  end else begin
-    Result := 0;
+  end else
+  begin
     CloseHandle(DokanFileInfo.Context);
     DokanFileInfo.Context := INVALID_HANDLE_VALUE;
-    if DokanFileInfo.DeleteOnClose then begin
-      if DokanFileInfo.IsDirectory then begin
+    if DokanFileInfo.DeleteOnClose then
+    begin
+      if DokanFileInfo.IsDirectory then
+      begin
         DbgPrint('DeleteOnClose -> RemoveDirectory');
         if not RemoveDirectory(PChar(FilePath)) then
           DbgPrint('RemoveDirectory failed, error code = %d', [GetLastError]);
-      end else begin
+      end else
+      begin
         DbgPrint('DeleteOnClose -> DeleteFile');
         if not DeleteFile(PChar(FIlePath)) then
           DbgPrint('DeleteFile failed, error code = %d', [GetLastError]);
@@ -251,15 +268,15 @@ begin
   DbgPrint('');
 end;
 
-function MirrorCloseFile(FileName: PWideChar;
-                         var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+procedure MirrorCloseFile(FileName: PWideChar;
+                         var DokanFileInfo: TDokanFileInfo); stdcall;
 var
   FilePath: string;
 begin
-  Result := 0;
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('CloseFile: %s', [FilePath]);
-  if DokanFileInfo.Context <> INVALID_HANDLE_VALUE then begin
+  if DokanFileInfo.Context <> INVALID_HANDLE_VALUE then
+  begin
     DbgPrint('Error: file was not closed during cleanup');
     CloseHandle(DokanFileInfo.Context);
     DokanFileInfo.Context := INVALID_HANDLE_VALUE;
@@ -272,7 +289,7 @@ function MirrorReadFile(FileName: PWideChar;
                         NumberOfBytesToRead: Cardinal;
                         var NumberOfBytesRead: Cardinal;
                         Offset: Int64;
-                        var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                        var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
   Opened: Boolean;
@@ -280,29 +297,36 @@ begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('ReadFile: %s (Offset: %d, Length: %d)', [FilePath, Offset, NumberOfBytesToRead]);
   Opened := DokanFileInfo.Context = INVALID_HANDLE_VALUE;
-  if Opened then begin
+  if Opened then
+  begin
     DbgPrint('Invalid handle (maybe passed through cleanup?), creating new one');
     DokanFileInfo.Context := CreateFile(PChar(FilePath), GENERIC_READ, FILE_SHARE_READ, nil, OPEN_EXISTING, 0, 0);
   end;
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -GetLastError;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := ToNtStatus(GetLastError);
     DbgPrint('CreateFile failed, error code = %d', [-Result]);
   end else 
     try
-      if SetFilePointerEx(DokanFileInfo.Context, LARGE_INTEGER(Offset), nil, FILE_BEGIN) then begin
-        if ReadFile(DokanFileInfo.Context, Buffer, NumberOfBytesToRead, NumberOfBytesRead, nil) then begin
-          Result := 0;
+      if SetFilePointerEx(DokanFileInfo.Context, LARGE_INTEGER(Offset), nil, FILE_BEGIN) then
+      begin
+        if ReadFile(DokanFileInfo.Context, Buffer, NumberOfBytesToRead, NumberOfBytesRead, nil) then
+        begin
+          Result := NTSTATUS_SUCCESS;
           DbgPrint('Read: %d', [NumberOfBytesRead]);
-        end else begin
-          Result := -GetLastError;
+        end else
+        begin
+          Result := ToNtStatus(GetLastError);
           DbgPrint('ReadFile failed, error code = %d', [-Result]);
         end;
-      end else begin
-        Result := -GetLastError;
+      end else
+      begin
+        Result := ToNtStatus(GetLastError);
         DbgPrint('Seek failed, error code = %d', [-Result]);
       end;
     finally
-      if Opened then begin
+      if Opened then
+      begin
         CloseHandle(DokanFileInfo.Context);
         DokanFileInfo.Context := INVALID_HANDLE_VALUE;
       end;
@@ -315,7 +339,7 @@ function MirrorWriteFile(FileName: PWideChar;
                          NumberOfBytesToWrite: Cardinal;
                          var NumberOfBytesWritten: Cardinal;
                          Offset: Int64;
-                         var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                         var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
   Opened: Boolean;
@@ -323,29 +347,36 @@ begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('WriteFile: %s (Offset: %d, Length: %d)', [FilePath, Offset, NumberOfBytesToWrite]);
   Opened := DokanFileInfo.Context = INVALID_HANDLE_VALUE;
-  if Opened then begin
+  if Opened then
+  begin
     DbgPrint('Invalid handle (maybe passed through cleanup?), creating new one');
     DokanFileInfo.Context := CreateFile(PChar(FilePath), GENERIC_WRITE, FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
   end;
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -GetLastError;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := ToNtStatus(GetLastError);
     DbgPrint('CreateFile failed, error code = %d', [-Result]);
   end else
     try
-      if SetFilePointerEx(DokanFileInfo.Context, LARGE_INTEGER(Offset), nil, FILE_BEGIN) then begin
-        if WriteFile(DokanFileInfo.Context, Buffer, NumberOfBytesToWrite, NumberOfBytesWritten, nil) then begin
-          Result := 0;
+      if SetFilePointerEx(DokanFileInfo.Context, LARGE_INTEGER(Offset), nil, FILE_BEGIN) then
+      begin
+        if WriteFile(DokanFileInfo.Context, Buffer, NumberOfBytesToWrite, NumberOfBytesWritten, nil) then
+        begin
+          Result := NTSTATUS_SUCCESS;
           DbgPrint('Written: %d', [NumberOfBytesWritten]);
-        end else begin
-          Result := -GetLastError;
+        end else
+        begin
+          Result := ToNtStatus(GetLastError);
           DbgPrint('ReadFile failed, error code = %d', [-Result]);
         end;
-      end else begin
-        Result := -GetLastError;
+      end else
+      begin
+        Result := ToNtStatus(GetLastError);
         DbgPrint('Seek failed, error code = %d', [-Result]);
       end;
     finally
-      if Opened then begin
+      if Opened then
+      begin
         CloseHandle(DokanFileInfo.Context);
         DokanFileInfo.Context := INVALID_HANDLE_VALUE;
       end;
@@ -354,20 +385,23 @@ begin
 end;
 
 function MirrorFlushFileBuffers(FileName: PWideChar;
-                                var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                                var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('FlushFileBuffers: %s', [FilePath]);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -1;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := NTSTATUS_INVALID_HANDLE;
     DbgPrint('Error: invalid handle')
-  end else begin
+  end else
+  begin
     if FlushFileBuffers(DokanFileInfo.Context) then
-      Result := 0
-    else begin
-      Result := -GetLastError;
+      Result := NTSTATUS_SUCCESS
+    else
+    begin
+      Result := ToNtStatus(GetLastError);
       DbgPrint('FlushFileBuffers failed, error code = %d', [-Result]);
     end;
   end;
@@ -376,7 +410,7 @@ end;
 
 function MirrorGetFileInformation(FileName: PWideChar;
                                   FileInformation: PByHandleFileInformation;
-                                  var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                                  var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
   Opened: Boolean;
@@ -386,30 +420,37 @@ begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('GetFileInformation: %s', [FilePath]);
   Opened := DokanFileInfo.Context = INVALID_HANDLE_VALUE;
-  if Opened then begin
+  if Opened then
+  begin
     DbgPrint('Invalid handle (maybe passed through cleanup?), creating new one');
     DokanFileInfo.Context := CreateFile(PChar(FilePath), GENERIC_WRITE, FILE_SHARE_READ, nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
   end;
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -1;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := NTSTATUS_INVALID_HANDLE;
     DbgPrint('CreateFile failed, error code = %d', [GetLastError]);
   end else
     try
       if GetFileInformationByHandle(DokanFileInfo.Context, FileInformation^) then
-        Result := 0
-      else begin
+        Result := NTSTATUS_SUCCESS
+      else
+      begin
         DbgPrint('GetFileInformationByHandle failed, error code = %d', [GetLastError]);
-        if Length(FileName) = 1 then begin
-          Result := 0;
+        if Length(FileName) = 1 then
+        begin
+          Result := NTSTATUS_SUCCESS;
           FileInformation.dwFileAttributes := GetFileAttributes(PChar(FilePath));
-        end else begin
+        end else
+        begin
           ZeroMemory(@FindData, SizeOf(FindData));
-          FindHandle := FindFirstFile(PChar(FilePath), FindData);
-          if FindHandle = INVALID_HANDLE_VALUE then begin
-            Result := -1;
+          FindHandle := FindFirstFileA(PAnsiChar(AnsiString(FilePath)), FindData);
+          if FindHandle = INVALID_HANDLE_VALUE then
+          begin
+            Result := NTSTATUS_INVALID_HANDLE;
             DbgPrint('FindFirstFile failed, error code = %d', [GetLastError]);
-          end else begin
-            Result := 0;
+          end else
+          begin
+            Result := NTSTATUS_SUCCESS;
             FileInformation.dwFileAttributes := FindData.dwFileAttributes;
             FileInformation.ftCreationTime := FindData.ftCreationTime;
             FileInformation.ftLastAccessTime := FindData.ftLastAccessTime;
@@ -421,7 +462,8 @@ begin
         end;
       end;
     finally
-      if Opened then begin
+      if Opened then
+      begin
         CloseHandle(DokanFileInfo.Context);
         DokanFileInfo.Context := INVALID_HANDLE_VALUE;
       end;
@@ -431,7 +473,7 @@ end;
 
 function MirrorFindFiles(PathName: PWideChar;
                          FillFindDataCallback: TDokanFillFindData;
-                         var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                         var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: widestring;
   FindData: WIN32_FIND_DATAW;
@@ -440,11 +482,13 @@ begin
   FilePath := MirrorConvertPath(PathName) + '\*';
   DbgPrint('GetFileInformation: %s', [FilePath]);
   FindHandle := FindFirstFileW(PWideChar(FilePath), FindData);
-  if FindHandle = INVALID_HANDLE_VALUE then begin
-    Result := -1;
+  if FindHandle = INVALID_HANDLE_VALUE then
+  begin
+    Result := NTSTATUS_INVALID_HANDLE;
     DbgPrint('FindFirstFile failed, error code = %d', [GetLastError]);
-  end else begin
-    Result := 0;
+  end else
+  begin
+    Result := NTSTATUS_SUCCESS;
     try
       FillFindDataCallback(FindData, DokanFileInfo);
       while FindNextFileW(FindHandle, FindData) do
@@ -458,16 +502,17 @@ end;
 
 function MirrorSetFileAttributes(FileName: PWideChar;
                                  FileAttributes: Cardinal;
-                                 var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                                 var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('SetFileAttributes: %s', [FilePath]);
   if SetFileAttributes(PChar(FilePath), FileAttributes) then
-    Result := 0
-  else begin
-    Result := -GetLastError;
+    Result := NTSTATUS_SUCCESS
+  else
+  begin
+    Result := ToNtStatus(GetLastError);
     DbgPrint('SetFileAttributes failed, error code = %d', [-Result]);
   end;
   DbgPrint('');
@@ -475,20 +520,23 @@ end;
 
 function MirrorSetFileTime(FileName: PWideChar;
                            CreationTime, LastAccessTime, LastWriteTime: PFileTime;
-                           var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                           var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('SetFileTime: %s', [FilePath]);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -1;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := NTSTATUS_INVALID_HANDLE;
     DbgPrint('Error: invalid handle');
-  end else begin
+  end else
+  begin
     if SetFileTime(DokanFileInfo.Context, CreationTime, LastAccessTime, LastWriteTime) then
-      Result := 0
-    else begin
-      Result := -GetLastError;
+      Result := NTSTATUS_SUCCESS
+    else
+    begin
+      Result := ToNtStatus(GetLastError);
       DbgPrint('SetFileTime failed, error code = %d', [-Result]);
     end;
   end;
@@ -496,18 +544,18 @@ begin
 end;
 
 function MirrorDeleteFile(FileName: PWideChar;
-                          var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                          var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
-  Result := 0;
+  Result := NTSTATUS_SUCCESS;
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('DeleteFile: %s', [FilePath]);
   DbgPrint('');
 end;
 
 function MirrorDeleteDirectory(FileName: PWideChar;
-                               var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                               var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
   FindData: WIN32_FIND_DATAA;
@@ -515,14 +563,16 @@ var
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('DeleteDirectory: %s', [FilePath]);
-  FindHandle := FindFirstFile(PChar(FilePath), FindData);
-  if FindHandle = INVALID_HANDLE_VALUE then begin
-    Result := -GetLastError;
+  FindHandle := FindFirstFileA(PAnsiChar(AnsiString(FilePath)), FindData);
+  if FindHandle = INVALID_HANDLE_VALUE then
+  begin
+    Result := ToNtStatus(GetLastError);
     if Result = -ERROR_NO_MORE_FILES then
-      Result := 0
+      Result := NTSTATUS_SUCCESS
     else
       DbgPrint('FindFirstFile failed, error code = %d', [-Result]);
-  end else begin
+  end else
+  begin
     Cardinal(Result) := STATUS_DIRECTORY_NOT_EMPTY;
     Result := -Result;
     Windows.FindClose(FindHandle);
@@ -532,7 +582,7 @@ end;
 
 function MirrorMoveFile(ExistingFileName, NewFileName: PWideChar;
                         ReplaceExisiting: LongBool;
-                        var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                        var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   ExistingFilePath, NewFilePath: string;
   Status: Boolean;
@@ -540,7 +590,8 @@ begin
   ExistingFilePath := MirrorConvertPath(ExistingFileName);
   NewFilePath := MirrorConvertPath(NewFileName);
   DbgPrint('MoveFile: %s -> %s', [ExistingFilePath, NewFilePath]);
-  if DokanFileInfo.Context <> INVALID_HANDLE_VALUE then begin
+  if DokanFileInfo.Context <> INVALID_HANDLE_VALUE then
+  begin
     CloseHandle(DokanFileInfo.Context);
     DokanFileInfo.Context := INVALID_HANDLE_VALUE;
   end;
@@ -549,9 +600,10 @@ begin
   else
     Status := MoveFile(PChar(ExistingFilePath), PChar(NewFilePath));
   if Status then
-    Result := 0
-  else begin
-    Result := -GetLastError;
+    Result := NTSTATUS_SUCCESS
+  else
+  begin
+    Result := ToNtStatus(GetLastError);
     DbgPrint('MoveFile failed, error code = %d', [-Result]);
   end;
   DbgPrint('');
@@ -559,25 +611,30 @@ end;
 
 function MirrorSetEndOfFile(FileName: PWideChar;
                             Length: Int64;
-                            var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                            var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('SetEndOfFile: %s', [FilePath]);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
-    Result := -1;
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
+    Result := NTSTATUS_INVALID_HANDLE;
     DbgPrint('Invalid handle');
-  end else begin
-    if SetFilePointerEx(DokanFileInfo.Context, LARGE_INTEGER(Length), nil, FILE_BEGIN) then begin
+  end else
+  begin
+    if SetFilePointerEx(DokanFileInfo.Context, LARGE_INTEGER(Length), nil, FILE_BEGIN) then
+    begin
       if SetEndOfFile(DokanFileInfo.Context) then
-        Result := 0
-      else begin
-        Result := -GetLastError;
+        Result := NTSTATUS_SUCCESS
+      else
+      begin
+        Result := ToNtStatus(GetLastError);
         DbgPrint('SetEndOfFile failed, error code = %d', [-Result]);
       end;
-    end else begin
-      Result := -GetLastError;
+    end else
+    begin
+      Result := ToNtStatus(GetLastError);
       DbgPrint('Seek failed, error code = %d', [-Result]);
     end;
   end;
@@ -586,22 +643,25 @@ end;
 
 function MirrorLockFile(FileName: PWideChar;
                         Offset, Length: Int64;
-                        var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                        var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 var
   FilePath: string;
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('LockFile: %s', [FilePath]);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
     DbgPrint('Invalid handle');
-    Result := -1;
-  end else begin
+    Result := NTSTATUS_INVALID_HANDLE;
+  end else
+  begin
     if LockFile(DokanFileInfo.Context,
                 LARGE_INTEGER(Offset).LowPart, LARGE_INTEGER(Offset).HighPart,
                 LARGE_INTEGER(Length).LowPart, LARGE_INTEGER(Length).HighPart) then
-      Result := 0
-    else begin
-      Result := -GetLastError;
+      Result := NTSTATUS_SUCCESS
+    else
+    begin
+      Result := ToNtStatus(GetLastError);
       DbgPrint('LockFile failed, error code = %d', [-Result]);
     end;
   end;
@@ -610,7 +670,7 @@ end;
 
 function MirrorUnlockFile(FileName: PWideChar;
                           Offset, Length: Int64;
-                          var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+                          var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 
 
 var
@@ -618,25 +678,28 @@ var
 begin
   FilePath := MirrorConvertPath(FileName);
   DbgPrint('LockFile: %s', [FilePath]);
-  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then begin
+  if DokanFileInfo.Context = INVALID_HANDLE_VALUE then
+  begin
     DbgPrint('Invalid handle');
-    Result := -1;
-  end else begin
+    Result := NTSTATUS_INVALID_HANDLE;
+  end else
+  begin
     if UnlockFile(DokanFileInfo.Context,
                   LARGE_INTEGER(Offset).LowPart, LARGE_INTEGER(Offset).HighPart,
                   LARGE_INTEGER(Length).LowPart, LARGE_INTEGER(Length).HighPart) then
-      Result := 0
-    else begin
-      Result := -GetLastError;
+      Result := NTSTATUS_SUCCESS
+    else
+    begin
+      Result := ToNtStatus(GetLastError);
       DbgPrint('UnlockFile failed, error code = %d', [-Result]);
     end;
   end;
   DbgPrint('');
 end;
 
-function MirrorUnmount(var DokanFileInfo: TDokanFileInfo): Integer; stdcall;
+function MirrorUnmount(var DokanFileInfo: TDokanFileInfo): NTSTATUS; stdcall;
 begin
-  Result := 0;
+  Result := NTSTATUS_SUCCESS;
   DbgPrint('Unmount');
   DbgPrint('');
 end;
@@ -663,28 +726,32 @@ var
     DeleteDirectory: MirrorDeleteDirectory;
     MoveFile: MirrorMoveFile;
     SetEndOfFile: MirrorSetEndOfFile;
+    SetAllocationSize: nil;
     LockFile: MirrorLockFile;
     UnlockFile: MirrorUnlockFile;
     GetDiskFreeSpace: nil;
     GetVolumeInformation: nil;
-    Unmount: MirrorUnmount
+    Unmount: MirrorUnmount;
+    GetFileSecurity: nil;
+    SetFileSecurity: nil;
+    FindStreams: nil
   );
 
   g_DokanOptions: TDokanOptions = (
-    DriveLetter: #0;
+    Version : 0;
     ThreadCount: 0;
-    DebugMode: False;
-    UseStdErr: False;
-    UseAltStream: False;
-    UseKeepAlive: False;
+    Options: 0;
     GlobalContext: 0;
+    MountPoint: #0;
+    Timeout: 30000;
   );
 
 // Utilities routines
 procedure DbgPrint(const Message: string); overload;
 begin
-  if g_DokanOptions.DebugMode then begin
-    if g_DokanOptions.UseStdErr then
+  if (g_DokanOptions.Options and DOKAN_OPTION_DEBUG) = DOKAN_OPTION_DEBUG then
+  begin
+    if (g_DokanOptions.Options and DOKAN_OPTION_STDERR) = DOKAN_OPTION_STDERR then
       Writeln(ErrOutput,Message)
     else
       Writeln(Message)
@@ -693,8 +760,9 @@ end;
 
 procedure DbgPrint(const Format: string; const Args: array of const); overload;
 begin
-  if g_DokanOptions.DebugMode then begin
-    if g_DokanOptions.UseStdErr then
+  if (g_DokanOptions.Options and DOKAN_OPTION_DEBUG) = DOKAN_OPTION_DEBUG then
+  begin
+    if (g_DokanOptions.Options and DOKAN_OPTION_STDERR) = DOKAN_OPTION_STDERR then
       Writeln(ErrOutput,SysUtils.Format(Format,Args))
     else
       Writeln(SysUtils.Format(Format,Args))
@@ -703,7 +771,8 @@ end;
 
 function MirrorConvertPath(FileName: PWideChar): string;
 begin
-  if FileName = nil then begin
+  if FileName = nil then
+  begin
     WriteLn('Null filename');
     Result := g_RootDirectory
   end else
@@ -720,10 +789,12 @@ var
     i: Integer;
     c: Char;
   begin
-    if (Length(s) = 2) and (s[1] in ['/','-','\']) then begin
+    if (Length(s) = 2) and CharInSet(s[1],['/','-','\']) then
+    begin
       c := UpCase(s[2]);
       for i:=Low(t) to High(t) do
-        if t[i] = c then begin
+        if t[i] = c then
+        begin
           Result := i;
           Exit;
         end;
@@ -733,9 +804,12 @@ var
 
 begin
   IsMultiThread := True;
-  i := 1;
-  while i <= ParamCount do begin
-    case FindSwitch(ParamStr(i), ['R','L','T','D','S']) of
+  i := 1;        
+  g_DokanOptions.Version := DOKAN_VERSION;
+  g_DokanOptions.ThreadCount := 0; //use default
+  while i <= ParamCount do
+  begin
+    case FindSwitch(ParamStr(i), ['R','L','T','D','S','N','M','I']) of
       0: begin
         if (i = ParamCount) or (ParamStr(i+1) = '') then
           raise Exception.Create('Missing root directory after /R');
@@ -743,10 +817,10 @@ begin
         g_RootDirectory := ParamStr(i);
       end;
       1: begin
-        if (i = ParamCount) or (Length(ParamStr(i+1)) <> 1) then
+        if (i = ParamCount) then //or (Length(ParamStr(i+1)) <> 1) then
           raise Exception.Create('Missing drive letter after /L');
         Inc(i);
-        g_DokanOptions.DriveLetter := WideString(ParamStr(i))[1];
+        g_DokanOptions.MountPoint := PWideChar(ParamStr(i));
       end;
       2: begin
         if (i = ParamCount) or (ParamStr(i+1) = '') then
@@ -754,19 +828,33 @@ begin
         Inc(i);
         g_DokanOptions.ThreadCount := StrToInt(ParamStr(i));
       end;
-      3: g_DokanOptions.DebugMode := True;
-      4: g_DokanOptions.UseStdErr := True;
+      3: g_DokanOptions.Options := g_DokanOptions.Options or DOKAN_OPTION_DEBUG;
+      4: g_DokanOptions.Options := g_DokanOptions.Options or DOKAN_OPTION_STDERR;
+      5: g_DokanOptions.Options := g_DokanOptions.Options or DOKAN_OPTION_NETWORK;
+      6: g_DokanOptions.Options := g_DokanOptions.Options or DOKAN_OPTION_REMOVABLE;
+      7: begin
+        if (i = ParamCount) or (ParamStr(i+1) = '') then
+          raise Exception.Create('Missing timeout after /I');
+        Inc(i);
+        g_DokanOptions.Timeout := StrToInt(ParamStr(i));
+      end;
     end;
     Inc(i);
   end;
-  if (g_RootDirectory = '') or (g_DokanOptions.DriveLetter = #0) then begin
+  g_DokanOptions.Options := g_DokanOptions.Options or DOKAN_OPTION_ALT_STREAM;
+  if (g_RootDirectory = '') or (g_DokanOptions.MountPoint = #0) then
+  begin
     WriteLn('Usage: ',ExtractFileName(ParamStr(0)));
     WriteLn('   /R RootDirectory    (e.g. /R C:\test)');
     WriteLn('   /L DriveLetter      (e.g. /L m)');
     WriteLn('   /T ThreadCount      (optional, e.g. /T 5)');
     WriteLn('   /D                  (optional, enable debug output)');
     WriteLn('   /S                  (optional, use stderr for output)');
-  end else begin
+    WriteLn('   /N                  (optional, use network drive)');
+    WriteLn('   /M                  (optional, use removable drive)');
+    WriteLn('   /I                  (optional, Timeout in Milliseconds ex. /I 30000)');
+  end else
+  begin
     i := DokanMain(g_DokanOptions, g_DokanOperations);
     if i <> DOKAN_SUCCESS then
       raise EDokanMainError.Create(i);
